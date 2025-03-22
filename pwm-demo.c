@@ -1,27 +1,24 @@
-/**
- * V. Hunter Adams (vha3@cornell.edu)
- * PWM demo code with serial input
- *
- * This demonstration sets a PWM duty cycle to a
- * user-specified value.
- *
- * HARDWARE CONNECTIONS
- *   - GPIO 4 ---> PWM output
- *
- */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
-
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 
 #include "hardware/pwm.h"
 #include "hardware/irq.h"
 #include "hardware/adc.h"
+#include "hardware/gpio.h"
+#include "hardware/timer.h"
 
 #include "pt_cornell_rp2040_v1_3.h"
+
+// RPM SENSOR CONFIG
+#define LEFT_SENSOR_PIN 9
+#define RIGHT_SENSOR_PIN 8
+#define M_PER_TICK 0.0243         // TODO: Empirically tune
+#define VELOCITY_TIMEOUT_US 50000 // 50ms timeout to reset velocity to 0 (to account for lack of interrupt)
+#define FILTER_SIZE 10            // Number of samples for rolling average
 
 // 5 kHz frequency
 #define WRAPVAL 5000
@@ -29,7 +26,7 @@
 
 // GPIO output for PWM
 #define PWM_OUT_A 18
-#define PWM_OUT_B 20
+#define PWM_OUT_B 19
 
 #define BRAKE_A 16
 #define ENABLE_A 17
@@ -41,56 +38,140 @@
 
 #define MAX_DUTY_CYCLE 1.0f
 
-#define MAX_THROTTLE_CHANGE_PER_SECOND 1.0f
+#define MAX_THROTTLE_CHANGE_PER_SECOND_UP 4.0f
+#define MAX_THROTTLE_CHANGE_PER_SECOND_DOWN 8.0f
 
-// One PWM slice corresponds to both GPIO pins
-uint slice_num_a = 1;
-uint slice_num_b = 2;
+// ENCODER VARS
+volatile uint32_t last_left_time = 0;
+volatile uint32_t last_right_time = 0;
+volatile float left_velocity = 0.0;
+volatile float right_velocity = 0.0;
+
+volatile int light_on = 0;
+
+float left_velocity_buffer[FILTER_SIZE] = {0};
+float right_velocity_buffer[FILTER_SIZE] = {0};
+int left_index = 0, right_index = 0;
+
+// PWM VARS
+uint slice_num = 1;
+
+volatile float last_throttle = 0;
+volatile float throttle = 0;
 
 volatile uint16_t last_control = 0;
 volatile uint16_t control = 0;
+volatile uint32_t last_time_micro = 0;
 
-// PWM interrupt service routine
-// void on_pwm_wrap()
-// {
-//     // Clear the interrupt flag that brought us here
-//     pwm_clear_irq(slice_num_a);
-//     pwm_clear_irq(slice_num_b);
+float min_scaling_vel = 1.0;
+float max_scaling_vel = 5.0;
+int min_duty_cycle = 2000;
 
-//     // Update duty cycle if control input changed
-//     if (control != last_control)
-//     {
-//         // Both channels correspond to one GPIO pin
-//         pwm_set_chan_level(slice_num_a, PWM_CHAN_A, control);
-//         pwm_set_chan_level(slice_num_b, PWM_CHAN_B, control);
-//         last_control = control;
-//     }
-// }
+float rolling_average(float *buffer, int size)
+{
+    float sum = 0.0;
+    for (int i = 0; i < size; i++)
+    {
+        sum += buffer[i];
+    }
+    return sum / size;
+}
+
+void left_wheel_isr(uint gpio, uint32_t events)
+{
+    gpio_put(25, 1);
+
+    uint32_t current_time = time_us_32();
+    if (last_left_time != 0)
+    {
+        uint32_t delta_time = current_time - last_left_time;
+        float new_velocity = M_PER_TICK / (delta_time / 1e6); // Convert to meters per second
+        left_velocity_buffer[left_index] = new_velocity;
+        left_index = (left_index + 1) % FILTER_SIZE;
+
+        float avg = rolling_average(left_velocity_buffer, FILTER_SIZE);
+        if (avg < left_velocity + 1)
+        {
+            left_velocity = avg;
+        }
+    }
+    last_left_time = current_time;
+}
+
+void right_wheel_isr(uint gpio, uint32_t events)
+{
+    gpio_put(25, 1);
+
+    uint32_t current_time = time_us_32();
+    if (last_right_time != 0)
+    {
+        uint32_t delta_time = current_time - last_right_time;
+        float new_velocity = M_PER_TICK / (delta_time / 1e6); // Convert to meters per second
+        right_velocity_buffer[right_index] = new_velocity;
+        right_index = (right_index + 1) % FILTER_SIZE;
+
+        float avg = rolling_average(right_velocity_buffer, FILTER_SIZE);
+        if (avg < right_velocity + 1)
+        {
+            right_velocity = avg;
+        }
+    }
+    last_right_time = current_time;
+}
 
 void on_pwm_wrap()
 {
-    // Check which PWM slice triggered the interrupt
-    uint32_t irq_status = pwm_hw->ints;
+    // Clear the interrupt flag that brought us here
+    pwm_clear_irq(slice_num);
 
-    if (irq_status & (1 << slice_num_a))
+    // Get current time
+    uint32_t current_time_micro = time_us_32();
+    float delta_time_s = ((float)(current_time_micro - last_time_micro)) / 1e6;
+    last_time_micro = current_time_micro;
+
+    float max_control = last_throttle + MAX_THROTTLE_CHANGE_PER_SECOND_UP * delta_time_s;
+    float min_control = last_throttle - MAX_THROTTLE_CHANGE_PER_SECOND_DOWN * delta_time_s;
+
+    if (max_control > 1.0)
     {
-        pwm_clear_irq(slice_num_a);
+        max_control = 1.0;
     }
 
-    if (irq_status & (1 << slice_num_b))
+    if (min_control < 0.0)
     {
-        pwm_clear_irq(slice_num_b);
+        min_control = 0.0;
     }
+
+    if (throttle > max_control)
+    {
+        throttle = max_control;
+    }
+
+    if (throttle < min_control)
+    {
+        throttle = min_control;
+    }
+
+    last_throttle = throttle;
+
+    int multiplier = 5400;
+
+    // if (right_velocity < min_scaling_vel)
+    // {
+    //     multiplier = min_duty_cycle;
+    // }
+    // else if (right_velocity < max_scaling_vel)
+    // {
+    //     float diff = right_velocity - min_scaling_vel;
+    //     float mult_diff = multiplier - min_duty_cycle;
+    //     multiplier = min_duty_cycle + (diff / (max_scaling_vel - min_scaling_vel)) * mult_diff;
+    // }
 
     // Update duty cycle if control input changed
-    if (control != last_control)
-    {
-        pwm_set_chan_level(slice_num_a, PWM_CHAN_A, control);
-        pwm_set_chan_level(slice_num_a, PWM_CHAN_B, control);
-        pwm_set_chan_level(slice_num_b, PWM_CHAN_A, control);
-        pwm_set_chan_level(slice_num_b, PWM_CHAN_B, control);
-        last_control = control;
-    }
+    // Both channels correspond to one GPIO pin
+    control = (int)(throttle * multiplier);
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
+    pwm_set_chan_level(slice_num, PWM_CHAN_B, control);
 }
 
 static PT_THREAD(protothread_serial(struct pt *pt))
@@ -99,17 +180,33 @@ static PT_THREAD(protothread_serial(struct pt *pt))
     static int test_in;
     while (1)
     {
+        uint32_t current_time = time_us_32();
+
+        // Check for timeout on left wheel
+        if ((current_time - last_left_time) > VELOCITY_TIMEOUT_US)
+        {
+            left_velocity = 0.0;
+        }
+
+        // Check for timeout on right wheel
+        if ((current_time - last_right_time) > VELOCITY_TIMEOUT_US)
+        {
+            right_velocity = 0.0;
+        }
+
+        printf("Left Velocity: %.2f m/s, Right Velocity: %.2f m/s\n", left_velocity, right_velocity);
+
         // Read throttle
         uint16_t val = adc_read();
 
         if (val < 1500) // Stop if too small value (safety)
         {
-            control = 0;
+            throttle = 0;
         }
         else
         {
-            // Map to maximum 40%
-            control = (int)((val - 1500) * (MAX_DUTY_CYCLE * 3));
+            // throttle = (val - 1500) * (3.0 / 5500.0);
+            throttle = (((val - 1500) * (MAX_DUTY_CYCLE * 3))) / 5500;
         }
     }
     PT_END(pt);
@@ -149,28 +246,31 @@ int main()
     gpio_set_function(PWM_OUT_B, GPIO_FUNC_PWM);
 
     // Schedule PWM setting interrupt
-    pwm_clear_irq(slice_num_a);
-    pwm_set_irq_enabled(slice_num_a, true);
-    pwm_clear_irq(slice_num_b);
-    pwm_set_irq_enabled(slice_num_b, true);
+    pwm_clear_irq(slice_num);
+    pwm_set_irq_enabled(slice_num, true);
     irq_set_exclusive_handler(PWM_IRQ_WRAP, on_pwm_wrap);
     irq_set_enabled(PWM_IRQ_WRAP, true);
 
-    pwm_set_wrap(slice_num_a, WRAPVAL);
-    pwm_set_clkdiv(slice_num_a, CLKDIV);
-    pwm_set_wrap(slice_num_b, WRAPVAL);
-    pwm_set_clkdiv(slice_num_b, CLKDIV);
+    pwm_set_wrap(slice_num, WRAPVAL);
+    pwm_set_clkdiv(slice_num, CLKDIV);
 
-    pwm_set_chan_level(slice_num_a, PWM_CHAN_A, 0);
-    pwm_set_chan_level(slice_num_a, PWM_CHAN_B, 0);
-    pwm_set_chan_level(slice_num_b, PWM_CHAN_A, 0);
-    pwm_set_chan_level(slice_num_b, PWM_CHAN_B, 0);
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, 0);
+    pwm_set_chan_level(slice_num, PWM_CHAN_B, 0);
 
     // Switch on PWM slice
-    pwm_set_mask_enabled((1u << slice_num_a));
-    pwm_set_mask_enabled((1u << slice_num_b));
+    pwm_set_mask_enabled((1u << slice_num));
 
-    // start throttle thread
+    // Configure GPIO for sensors
+    gpio_init(LEFT_SENSOR_PIN);
+    gpio_set_dir(LEFT_SENSOR_PIN, GPIO_IN);
+    gpio_pull_up(LEFT_SENSOR_PIN);
+    gpio_set_irq_enabled_with_callback(LEFT_SENSOR_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &left_wheel_isr);
+
+    gpio_init(RIGHT_SENSOR_PIN);
+    gpio_set_dir(RIGHT_SENSOR_PIN, GPIO_IN);
+    gpio_pull_up(RIGHT_SENSOR_PIN);
+    gpio_set_irq_enabled_with_callback(RIGHT_SENSOR_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &right_wheel_isr);
+
     pt_add_thread(protothread_serial);
     pt_schedule_start;
 }
