@@ -12,21 +12,24 @@
 #include <string.h>
 
 // RPM SENSOR CONFIG
-#define LEFT_SENSOR_PIN 6  // TODO : Change pin according to set-up
-#define RIGHT_SENSOR_PIN 7 // TODO : Change pin according to set-up
-#define M_PER_TICK 0.0243  // TODO: Empirically tune
+#define LEFT_SENSOR_PIN 26  // TODO : Change pin according to set-up
+#define RIGHT_SENSOR_PIN 27 // TODO : Change pin according to set-up
+#define M_PER_TICK 0.0243   // TODO: Empirically tune
 #define VELOCITY_TIMEOUT_US                                                    \
   50000 // 50ms timeout to reset velocity to 0 (to account for lack of
         // interrupt)
 #define FILTER_SIZE 10 // Number of samples for rolling average
+
 // I2C Configuration
 #define I2C_PORT i2c0 // I2C port to use
-#define I2C_SDA_PIN 8 // TODO: Change pin according to set-up
-#define I2C_SCL_PIN 9 // TODO: Change pin according to set-up
+#define I2C_SDA_PIN 20
+#define I2C_SCL_PIN 21
 #define I2C_ADDR 0x55 // I2C device address
+
 // 5 kHz frequency
 #define WRAPVAL 5000
 #define CLKDIV 5.0f
+
 // GPIO output for PWM
 #define PWM_OUT_A 18
 #define PWM_OUT_B 19
@@ -38,6 +41,7 @@
 #define MAX_DUTY_CYCLE 1.0f
 #define MAX_THROTTLE_CHANGE_PER_SECOND_UP 4.0f
 #define MAX_THROTTLE_CHANGE_PER_SECOND_DOWN 8.0f
+
 // ENCODER VARS
 volatile uint32_t last_left_time = 0;
 volatile uint32_t last_right_time = 0;
@@ -47,6 +51,7 @@ volatile int light_on = 0;
 float left_velocity_buffer[FILTER_SIZE] = {0};
 float right_velocity_buffer[FILTER_SIZE] = {0};
 int left_index = 0, right_index = 0;
+
 // PWM VARS
 uint slice_num = 1;
 volatile float last_throttle = 0;
@@ -64,7 +69,9 @@ float rolling_average(float *buffer, int size) {
   }
   return sum / size;
 }
+
 int calculate_rpm(float vel) { return (int)(vel * 60) / M_PER_TICK; }
+
 void left_wheel_isr(uint gpio, uint32_t events) {
   gpio_put(25, 1);
   uint32_t current_time = time_us_32();
@@ -81,6 +88,7 @@ void left_wheel_isr(uint gpio, uint32_t events) {
   }
   last_left_time = current_time;
 }
+
 void right_wheel_isr(uint gpio, uint32_t events) {
   gpio_put(25, 1);
   uint32_t current_time = time_us_32();
@@ -97,6 +105,7 @@ void right_wheel_isr(uint gpio, uint32_t events) {
   }
   last_right_time = current_time;
 }
+
 void on_pwm_wrap() {
   // Clear the interrupt flag that brought us here
   pwm_clear_irq(slice_num);
@@ -140,7 +149,7 @@ void on_pwm_wrap() {
 }
 
 void i2c_init_pico() {
-  i2c_init(I2C_PORT, 100000); // 1 MHz I2C clock speed
+  i2c_init(I2C_PORT, 100000); // 100 KHz I2C clock speed
   gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
   gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
   gpio_pull_up(I2C_SDA_PIN);
@@ -164,7 +173,15 @@ void send_i2c_data(float left_velocity, float right_velocity) {
   data[6] = (rightRPM >> 8) & 0xFF;
   data[7] = rightRPM & 0xFF;
   // Send RPM data via I2CI2C_PORT
-  i2c_write_blocking(I2C_PORT, I2C_ADDR, data, 8, true);
+  int b_written = i2c_write_blocking(I2C_PORT, I2C_ADDR, data, 8, false);
+
+  printf("Wrote %d bytes to 0x%02X: [%d, %d, %d, %d, %d, %d, %d, %d]\n",
+         b_written, I2C_ADDR, data[0], data[1], data[2], data[3], data[4],
+         data[5], data[6], data[7]);
+
+  // absolute_time_t timeout = make_timeout_time_ms(3); // 2 ms for 100 kHz
+  // i2c_write_blocking_until(I2C_PORT, I2C_ADDR, data, 8, false, timeout);
+
   printf("Left RPM: %d , Right RPM: %d\n", leftRPM, rightRPM);
 }
 
@@ -219,20 +236,23 @@ int main() {
                                      GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
                                      true, &right_wheel_isr);
 
+  // Wait for initialization to complete
+  sleep_ms(10);
+
   uint32_t last_print_time = 0;
   int test_in;
   while (1) {
     uint32_t current_time = time_us_32();
-    // Check for timeout on left wheel
+    // // Check for timeout on left wheel
     if ((current_time - last_left_time) > VELOCITY_TIMEOUT_US) {
       left_velocity = 0.0;
     }
-    // Check for timeout on right wheel
+    // // Check for timeout on right wheel
     if ((current_time - last_right_time) > VELOCITY_TIMEOUT_US) {
       right_velocity = 0.0;
     }
 
-    if (current_time - last_print_time > 1000) // Print every second
+    if ((current_time - last_print_time) > 1000000) // Print 1000 every second
     {
       last_print_time = current_time;
       // printf("Left Velocity: %.2f m/s, Right Velocity: %.2f m/s\n",
@@ -240,10 +260,11 @@ int main() {
       printf("Left RPM: %d , Right RPM: %d\n", calculate_rpm(left_velocity),
              calculate_rpm(right_velocity));
       send_i2c_data(left_velocity, right_velocity);
+      // }
+      printf("Left Velocity: %.2f m/s, Right Velocity: %.2f m/s\n",
+             left_velocity, right_velocity);
+      //  Read throttle
     }
-    // printf("Left Velocity: %.2f m/s, Right Velocity: %.2f m/s\n",
-    // left_velocity, right_velocity);
-    //  Read throttle
     uint16_t val = adc_read();
     if (val < 1500) // Stop if too small value (safety)
     {
