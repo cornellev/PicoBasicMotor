@@ -10,22 +10,28 @@
 #include "hardware/adc.h"
 #include "hardware/gpio.h"
 #include "hardware/timer.h"
-#include "hardware/i2c.h"
+#include "hardware/spi.h"
 
+#include "mcp2515.h"
 #include "pt_cornell_rp2040_v1_3.h"
 
+
+// CAN Configuration (Using SPI0, not the RPM sensor pins)
+#define CAN_SPI_PORT spi0
+#define CAN_MISO 0  // SPI0 RX
+#define CAN_MOSI 3  // SPI0 TX
+#define CAN_SCK 2   // SPI0 SCK
+#define CAN_CS 1    // SPI0 CSn
+#define CAN_INT 20   // Interrupt Pin
+
+MCP2515 can(CAN_CS);
+
 // RPM SENSOR CONFIG
-#define LEFT_SENSOR_PIN 6          //TODO : Change pin according to set-up
-#define RIGHT_SENSOR_PIN 7        //TODO : Change pin according to set-up
+#define LEFT_SENSOR_PIN 9
+#define RIGHT_SENSOR_PIN 8
 #define M_PER_TICK 0.0243         // TODO: Empirically tune
 #define VELOCITY_TIMEOUT_US 50000 // 50ms timeout to reset velocity to 0 (to account for lack of interrupt)
 #define FILTER_SIZE 10            // Number of samples for rolling average
-
-// I2C Configuration
-#define I2C_PORT i2c0
-#define I2C_SDA_PIN 8               //TODO: Change pin according to set-up
-#define I2C_SCL_PIN 9               //TODO: Change pin according to set-up
-#define I2C_ADDR 0x55 // I2C device address
 
 // 5 kHz frequency
 #define WRAPVAL 5000
@@ -60,6 +66,15 @@ float left_velocity_buffer[FILTER_SIZE] = {0};
 float right_velocity_buffer[FILTER_SIZE] = {0};
 int left_index = 0, right_index = 0;
 
+//CAN VARS
+uint32_t last_can_send_time = 0;
+const uint32_t CAN_SEND_INTERVAL_MS = 100;  //TODO: Adjust as needed
+
+#define QUEUE_SIZE 10
+volatile float left_velocity_queue;
+volatile float right_velocity_queue;
+volatile bool can_data_ready = false;
+
 // PWM VARS
 uint slice_num = 1;
 
@@ -84,9 +99,6 @@ float rolling_average(float *buffer, int size)
     return sum / size;
 }
 
-int calculate_rpm(float vel){ 
-    return (int)(vel *60)/M_PER_TICK;
-}
 void left_wheel_isr(uint gpio, uint32_t events)
 {
     gpio_put(25, 1);
@@ -182,27 +194,31 @@ void on_pwm_wrap()
     control = (int)(throttle * multiplier);
     pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
     pwm_set_chan_level(slice_num, PWM_CHAN_B, control);
+}
 
-    // ---- ADD I2C SEND FUNCTIONALITY ----
-    uint8_t data[8];
-    
-    // Convert left_velocity to int (same format as receive function expects)
-    int leftRPM = (int)(left_velocity * 1000);  // Convert m/s to RPM equivalent scale
-    int rightRPM = (int)(right_velocity * 1000);
+int velocity_to_rpm(float velocity) {
+    return (int)(velocity * 60.0 / M_PER_TICK);
+}
 
-    data[0] = (leftRPM >> 24) & 0xFF;
-    data[1] = (leftRPM >> 16) & 0xFF;
-    data[2] = (leftRPM >> 8) & 0xFF;
-    data[3] = leftRPM & 0xFF;
-    
-    data[4] = (rightRPM >> 24) & 0xFF;
-    data[5] = (rightRPM >> 16) & 0xFF;
-    data[6] = (rightRPM >> 8) & 0xFF;
-    data[7] = rightRPM & 0xFF;
+// TODO : fix to get proper RPM data
+void send_rpm_can() {
+    struct can_frame frame;
+    frame.can_id = 0x15; // RPM Message ID
+    frame.can_dlc = 4;
 
-    // Send RPM data via I2C
-    i2c_write_blocking(I2C_PORT, I2C_ADDR, data, 8, false);
+    int left_rpm = velocity_to_rpm(left_velocity);
+    int right_rpm = velocity_to_rpm(right_velocity);
 
+    frame.data[0] = (left_rpm >> 8) & 0xFF;
+    frame.data[1] = left_rpm & 0xFF;
+    frame.data[2] = (right_rpm >> 8) & 0xFF;
+    frame.data[3] = right_rpm & 0xFF;
+
+    if (can.sendMessage(&frame) == MCP2515::ERROR_OK) {
+        printf("Sent CAN RPM: Left: %d, Right: %d\n", left_rpm, right_rpm);
+    } else {
+        printf("CAN transmission failed!\n");
+    }
 }
 
 static PT_THREAD(protothread_serial(struct pt *pt))
@@ -239,22 +255,64 @@ static PT_THREAD(protothread_serial(struct pt *pt))
             // throttle = (val - 1500) * (3.0 / 5500.0);
             throttle = (((val - 1500) * (MAX_DUTY_CYCLE * 3))) / 5500;
         }
+
+
     }
     PT_END(pt);
 }
 
-void i2c_init_pico() {
-    i2c_init(I2C_PORT, 1000000); // 1 MHz I2C clock speed
-    gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA_PIN);
-    gpio_pull_up(I2C_SCL_PIN);
+// Core 1 Task (Handles CAN Processing)
+void can_core_task() {
+    // Initialize SPI0 for MCP2515
+    spi_init(CAN_SPI_PORT, 1 * 1000 * 1000);
+    gpio_set_function(CAN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(CAN_MOSI, GPIO_FUNC_SPI);
+    gpio_set_function(CAN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(CAN_CS, GPIO_FUNC_SIO);
+    gpio_set_dir(CAN_CS, GPIO_OUT);
+    gpio_put(CAN_CS, 1);
+
+    // Initialize MCP2515
+    can.reset();
+    if (can.setBitrate(CAN_500KBPS) != MCP2515::ERROR_OK) {
+        printf("Failed to set CAN bitrate\n");
+        while (1);
+    }
+    can.setNormalMode();
+    printf("CAN initialized successfully on Core 1\n");
+
+    while (1) {
+        if (can_data_ready) {
+            send_rpm_can();
+            can_data_ready = false;
+        }
+        sleep_ms(10);
+    }
 }
+
 
 int main()
 {
     stdio_init_all();
-    i2c_init_pico();
+    sleep_ms(2000); // Allow USB connection
+
+    // Initialize SPI0 for MCP2515 CAN Controller
+    // spi_init(CAN_SPI_PORT, 1 * 1000 * 1000); // 1 MHz
+    // gpio_set_function(CAN_MISO, GPIO_FUNC_SPI);
+    // gpio_set_function(CAN_MOSI, GPIO_FUNC_SPI);
+    // gpio_set_function(CAN_SCK, GPIO_FUNC_SPI);
+    // gpio_init(CAN_CS);
+    // gpio_set_dir(CAN_CS, GPIO_OUT);
+    // gpio_put(CAN_CS, 1);
+
+    // //Initialize MCP2515
+    // can.reset();
+    // if (can.setBitrate(CAN_500KBPS) != MCP2515::ERROR_OK) {
+    //     printf("Failed to set CAN bitrate\n");
+    //     while (1);
+    // }
+    // can.setNormalMode();
+    // printf("CAN initialized successfully\n");
 
     // Initialize throttle
     adc_init();
@@ -311,6 +369,30 @@ int main()
     gpio_pull_up(RIGHT_SENSOR_PIN);
     gpio_set_irq_enabled_with_callback(RIGHT_SENSOR_PIN, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &right_wheel_isr);
 
-    pt_add_thread(protothread_serial);
-    pt_schedule_start;
+    multicore_launch_core1(can_core_task);
+
+    while (1) {
+        uint32_t current_time = to_ms_since_boot(get_absolute_time());
+
+        // Reset velocity if no pulses for timeout duration
+        if ((current_time - last_left_time) > VELOCITY_TIMEOUT_US / 1000) {
+            left_velocity = 0.0;
+        }
+        if ((current_time - last_right_time) > VELOCITY_TIMEOUT_US / 1000) {
+            right_velocity = 0.0;
+        }
+
+        // Update CAN queue every 100ms
+        if ((current_time - last_can_send_time) >= CAN_SEND_INTERVAL_MS) {
+            left_velocity_queue = left_velocity;
+            right_velocity_queue = right_velocity;
+            can_data_ready = true;
+            last_can_send_time = current_time;
+        }
+
+        sleep_ms(10);
+    }
+
+    // pt_add_thread(protothread_serial);
+    // pt_schedule_start;
 }
