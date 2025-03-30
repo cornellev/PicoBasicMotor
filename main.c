@@ -55,9 +55,9 @@ volatile float last_throttle = 0;
 volatile float throttle = 0;
 volatile uint16_t control = 0;
 volatile uint32_t last_time_micro = 0;
-float min_scaling_vel = 1.0;
+float min_scaling_vel = 0.0;
 float max_scaling_vel = 5.0;
-int min_duty_cycle = 2000;
+int min_duty_cycle = 825;
 
 float rolling_average(float *buffer, int size) {
   float sum = 0.0;
@@ -222,17 +222,14 @@ int main() {
     if ((current_time - last_right_time) > VELOCITY_TIMEOUT_US)
       right_velocity = 0.0;
 
-    if ((current_time - last_print_time) > 1000) {
+    if ((current_time - last_print_time) > 10000) {
+      printf("%4f%4f\n", left_velocity, ((float)control) / 5500.0);
       last_print_time = current_time;
-      // send_uart_data(left_velocity, right_velocity);
     }
 
     uint16_t val = adc_read();
     throttle =
         (val < 1500) ? 0 : (((val - 1500) * (MAX_DUTY_CYCLE * 2.18))) / 5500;
-
-    printf("VEL: %4f Throttle: %4f Control: %4d\n", left_velocity, throttle,
-           control);
   }
   return 0;
 }
