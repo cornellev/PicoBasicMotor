@@ -14,13 +14,13 @@
 #include "pt_cornell_rp2040_v1_3.h"
 
 // RPM SENSOR CONFIG
-#define LEFT_SENSOR_PIN 26
-// #define RIGHT_SENSOR_PIN 27
+#define LEFT_RPM_SENSOR_PIN 26
+// #define RIGHT_RPM_SENSOR_PIN 27
 #define M_PER_TICK 0.0243
 #define VELOCITY_TIMEOUT_US 50000
 #define FILTER_SIZE 10
 
-// UART Configuration
+// UART CONFIG
 #define UART_PORT uart0
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1
@@ -31,14 +31,24 @@
 #define CLKDIV 5.0f
 
 // GPIO output for PWM
-#define PWM_OUT_A 17
-#define PWM_OUT_B 15
+#define LEFT_MOTOR_PWM 17
+#define RIGHT_MOTOR_PWM 15
 #define MOTOR_BRAKE 18
 #define MOTOR_ENABLE 19
+
+// THROTTLE INPUT
 #define THROTTLE_ADC_PIN 27
+
+// THROTTLE CONFIG
 #define MAX_DUTY_CYCLE 1.0f
-#define MAX_THROTTLE_CHANGE_PER_SECOND_UP 3.0f
-#define MAX_THROTTLE_CHANGE_PER_SECOND_DOWN 6.0f
+#define MAX_THROTTLE_CHANGE_PER_SECOND_UP .5f
+#define MAX_THROTTLE_CHANGE_PER_SECOND_DOWN 2.0f
+
+// STEER SENSOR CONFIG
+#define STEER_ADC_PIN 28
+
+// STEER VARS
+float steering = 0.0;
 
 // ENCODER VARS
 volatile uint32_t last_left_time = 0;
@@ -161,6 +171,19 @@ void send_uart_data(float left_velocity, float right_velocity) {
   uart_puts(UART_PORT, buffer);
 }
 
+float read_throttle() {
+  // adc_select_input(1);
+  uint16_t val = adc_read();
+  return (val < 1500) ? 0
+                      : (((val - 1500.0) * (MAX_DUTY_CYCLE * 2.18))) / 5500.0;
+}
+
+float read_steering() {
+  adc_select_input(2);
+  uint16_t val = adc_read();
+  return (float)val;
+}
+
 int main() {
   stdio_init_all();
   uart_init_pico();
@@ -168,6 +191,7 @@ int main() {
   adc_init();
   adc_gpio_init(THROTTLE_ADC_PIN);
   adc_select_input(1);
+  // adc_gpio_init(STEER_ADC_PIN);
 
   gpio_init(MOTOR_BRAKE);
   gpio_init(MOTOR_ENABLE);
@@ -180,11 +204,11 @@ int main() {
   gpio_set_dir(25, GPIO_OUT);
   gpio_put(25, 1);
 
-  gpio_set_function(PWM_OUT_A, GPIO_FUNC_PWM);
-  gpio_set_function(PWM_OUT_B, GPIO_FUNC_PWM);
+  gpio_set_function(LEFT_MOTOR_PWM, GPIO_FUNC_PWM);
+  gpio_set_function(RIGHT_MOTOR_PWM, GPIO_FUNC_PWM);
 
-  slice_num_a = pwm_gpio_to_slice_num(PWM_OUT_A);
-  slice_num_b = pwm_gpio_to_slice_num(PWM_OUT_B);
+  slice_num_a = pwm_gpio_to_slice_num(LEFT_MOTOR_PWM);
+  slice_num_b = pwm_gpio_to_slice_num(RIGHT_MOTOR_PWM);
 
   pwm_clear_irq(slice_num_a);
   pwm_set_irq_enabled(slice_num_a, true);
@@ -199,17 +223,17 @@ int main() {
   pwm_set_mask_enabled((1u << slice_num_a) | (1u << slice_num_b));
 
   // Configure GPIO for sensors
-  gpio_init(LEFT_SENSOR_PIN);
-  gpio_set_dir(LEFT_SENSOR_PIN, GPIO_IN);
-  gpio_pull_up(LEFT_SENSOR_PIN);
-  gpio_set_irq_enabled_with_callback(LEFT_SENSOR_PIN,
+  gpio_init(LEFT_RPM_SENSOR_PIN);
+  gpio_set_dir(LEFT_RPM_SENSOR_PIN, GPIO_IN);
+  gpio_pull_up(LEFT_RPM_SENSOR_PIN);
+  gpio_set_irq_enabled_with_callback(LEFT_RPM_SENSOR_PIN,
                                      GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
                                      true, &left_wheel_isr);
 
-  // gpio_init(RIGHT_SENSOR_PIN);
-  // gpio_set_dir(RIGHT_SENSOR_PIN, GPIO_IN);
-  // gpio_pull_up(RIGHT_SENSOR_PIN);
-  // gpio_set_irq_enabled_with_callback(RIGHT_SENSOR_PIN,
+  // gpio_init(RIGHT_RPM_SENSOR_PIN);
+  // gpio_set_dir(RIGHT_RPM_SENSOR_PIN, GPIO_IN);
+  // gpio_pull_up(RIGHT_RPM_SENSOR_PIN);
+  // gpio_set_irq_enabled_with_callback(RIGHT_RPM_SENSOR_PIN,
   //    GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
   //    true, &right_wheel_isr);
 
@@ -222,14 +246,13 @@ int main() {
     if ((current_time - last_right_time) > VELOCITY_TIMEOUT_US)
       right_velocity = 0.0;
 
+    throttle = read_throttle();
+    // steering = read_steering();
+
     if ((current_time - last_print_time) > 10000) {
-      printf("%4f%4f\n", left_velocity, ((float)control) / 5500.0);
+      printf("%4f%4f%4f\n", left_velocity, ((float)control) / 5500.0, steering);
       last_print_time = current_time;
     }
-
-    uint16_t val = adc_read();
-    throttle =
-        (val < 1500) ? 0 : (((val - 1500) * (MAX_DUTY_CYCLE * 2.18))) / 5500;
   }
   return 0;
 }
