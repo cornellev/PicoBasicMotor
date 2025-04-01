@@ -17,7 +17,7 @@
 #define LEFT_RPM_SENSOR_PIN 26
 // #define RIGHT_RPM_SENSOR_PIN 27
 #define M_PER_TICK 0.0243
-#define VELOCITY_TIMEOUT_US 50000
+#define VELOCITY_TIMEOUT_US 500000
 #define FILTER_SIZE 10
 
 // UART CONFIG
@@ -88,6 +88,7 @@ void left_wheel_isr(uint gpio, uint32_t events) {
     left_velocity_buffer[left_index] = new_velocity;
     left_index = (left_index + 1) % FILTER_SIZE;
     float avg = rolling_average(left_velocity_buffer, FILTER_SIZE);
+
     if (avg < left_velocity + 1) {
       left_velocity = avg;
     }
@@ -135,14 +136,15 @@ void on_pwm_wrap() {
   last_throttle = throttle;
   int multiplier = 5400;
 
-  if (left_velocity < min_scaling_vel)
-    multiplier = min_duty_cycle;
-  else if (left_velocity < max_scaling_vel) {
-    float diff = left_velocity - min_scaling_vel;
-    float mult_diff = multiplier - min_duty_cycle;
-    multiplier = min_duty_cycle +
-                 (diff / (max_scaling_vel - min_scaling_vel)) * mult_diff;
-  }
+  // if (left_velocity < min_scaling_vel)
+  //     multiplier = min_duty_cycle;
+  // else if (left_velocity < max_scaling_vel)
+  // {
+  //     float diff = left_velocity - min_scaling_vel;
+  //     float mult_diff = multiplier - min_duty_cycle;
+  //     multiplier = min_duty_cycle +
+  //                  (diff / (max_scaling_vel - min_scaling_vel)) * mult_diff;
+  // }
 
   control = (int)(throttle * multiplier);
   pwm_set_chan_level(slice_num_a, PWM_CHAN_B, control);
