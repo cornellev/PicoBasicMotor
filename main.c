@@ -249,6 +249,7 @@ int main() {
       right_velocity = 0.0;
 
     throttle = read_throttle();
+    steering = 0.0;
     // steering = read_steering();
 
     if ((current_time - last_print_time) > 10000) {
