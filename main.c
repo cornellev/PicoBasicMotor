@@ -14,7 +14,7 @@
 // RPM SENSOR CONFIG
 #define LEFT_RPM_SENSOR_PIN 26
 // #define RIGHT_RPM_SENSOR_PIN 27
-#define M_PER_TICK 0.0243
+#define M_PER_TICK 0.0243 // 22 inch diameter wheel over 72 rising and falling edges per revolution
 #define VELOCITY_TIMEOUT_US 500000
 #define FILTER_SIZE 10
 
@@ -51,11 +51,13 @@ float steering = 0.0;
 // ENCODER VARS
 volatile uint32_t last_left_time = 0;
 volatile uint32_t last_right_time = 0;
-volatile float left_velocity = 0.0;
-volatile float right_velocity = 0.0;
+
 float left_velocity_buffer[FILTER_SIZE] = {0};
 float right_velocity_buffer[FILTER_SIZE] = {0};
 int left_index = 0, right_index = 0;
+
+volatile float left_velocity = 0.0;
+volatile float right_velocity = 0.0;
 
 // PWM VARS
 int slice_num_a, slice_num_b;
@@ -77,7 +79,7 @@ float rolling_average(float *buffer, int size)
     return sum / size;
 }
 
-int calculate_rpm(float vel) { return (int)(vel * 60) / M_PER_TICK; }
+int calculate_rpm(float vel) { return (vel / M_PER_TICK) * 60.0; }
 
 void left_wheel_isr(uint gpio, uint32_t events)
 {
@@ -165,24 +167,6 @@ void uart_init_pico()
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
 }
 
-/*
-Format for sending packets:
-<L_RPM:1200,R_RPM:1150>\n
-*/
-void send_uart_data(float left_velocity, float right_velocity)
-{
-    char buffer[64];
-    // int leftRPM = calculate_rpm(left_velocity);
-    // int rightRPM = calculate_rpm(right_velocity);
-
-    // Above data format with fixed-length RPM values
-    snprintf(buffer, sizeof(buffer), "%4f%4f\n", left_velocity,
-             right_velocity);
-
-    // Send formatted data over UART
-    uart_puts(UART_PORT, buffer);
-}
-
 float read_throttle()
 {
     // adc_select_input(1);
@@ -265,9 +249,12 @@ int main()
         steering = 0.0;
         // steering = read_steering();
 
+        float left_rpm = calculate_rpm(left_velocity);
+
         if ((current_time - last_print_time) > 10000)
         {
-            printf("%4f%4f%4f\n", left_velocity, ((float)control) / 5500.0, steering);
+            // Timestamp in s, left rpm, throttle, steering
+            printf("%f %f %f %f\n", ((float)current_time) / 1000000.0, left_rpm, ((float)control) / 5500.0, steering);
             last_print_time = current_time;
         }
     }
