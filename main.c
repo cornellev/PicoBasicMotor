@@ -254,7 +254,7 @@ int main()
         if ((current_time - last_print_time) > 10000)
         {
             // Timestamp in s, left rpm, throttle, steering
-            printf("%f %f %f %f\n", ((float)current_time) / 1000000.0, left_rpm, ((float)control) / 5500.0, steering);
+            printf("%d %f %f %f\n", current_time, left_rpm, ((float)control) / 5500.0, steering);
             last_print_time = current_time;
         }
     }
