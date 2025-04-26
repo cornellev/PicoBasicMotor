@@ -40,7 +40,7 @@ add_executable(MotorSync)
 target_sources(MotorSync PRIVATE main.c)
 
 # Pull in our pico_stdlib which pulls in commonly used features
-target_link_libraries(MotorSync pico_stdlib pico_multicore hardware_gpio hardware_pwm hardware_clocks hardware_adc hardware_uart)
+target_link_libraries(MotorSync pico_stdlib pico_multicore hardware_gpio hardware_pwm hardware_clocks hardware_adc hardware_uart hardware_spi)
 
 # create map/bin/hex file etc.
 pico_add_extra_outputs(MotorSync)

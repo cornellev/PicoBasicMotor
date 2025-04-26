@@ -4,6 +4,7 @@
 #include "hardware/pwm.h"
 #include "hardware/timer.h"
 #include "hardware/uart.h"
+#include "hardware/spi.h"
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
 #include <math.h>
@@ -13,16 +14,18 @@
 
 // RPM SENSOR CONFIG
 #define LEFT_RPM_SENSOR_PIN 26
-// #define RIGHT_RPM_SENSOR_PIN 27
+#define RIGHT_RPM_SENSOR_PIN 27
 #define M_PER_TICK 0.0243 // 22 inch diameter wheel over 72 rising and falling edges per revolution
 #define VELOCITY_TIMEOUT_US 500000
 #define FILTER_SIZE 10
 
-// UART CONFIG
-#define UART_PORT uart0
-#define UART_TX_PIN 0
-#define UART_RX_PIN 1
-#define BAUD_RATE 115200
+// SPI CONFIG
+#define SPI_PORT        spi1
+#define SPI_SCK_PIN     10
+#define SPI_MOSI_PIN    11
+#define SPI_MISO_PIN    12   // not used here, but good to wire for full-duplex
+#define SPI_CS_PIN      13
+#define SPI_BAUDRATE    1000000 
 
 // PWM CONFIG
 #define WRAPVAL 5000
@@ -160,12 +163,29 @@ void on_pwm_wrap()
     pwm_set_chan_level(slice_num_b, PWM_CHAN_B, control);
 }
 
-void uart_init_pico()
-{
-    uart_init(UART_PORT, BAUD_RATE);
-    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-}
+// void uart_init_pico()
+// {
+//     uart_init(UART_PORT, BAUD_RATE);
+//     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+//     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+// }
+
+// helper, but is redundant... 
+// void send_spi_data(uint32_t timestamp,
+//     int left_rpm,
+//     float duty_frac,
+//     float steering)
+// {
+// char buf[64];
+// int len = snprintf(buf, sizeof(buf), "%u %d %f %f\n",
+//         timestamp, left_rpm, duty_frac, steering);
+// // assert chip‐select
+// gpio_put(SPI_CS_PIN, 0);
+// // master writes out the bytes
+// spi_write_blocking(SPI_PORT, (uint8_t*)buf, len);
+// // deassert CS
+// gpio_put(SPI_CS_PIN, 1);
+// }
 
 float read_throttle()
 {
@@ -182,9 +202,20 @@ float read_steering()
 }
 
 int main()
-{
+{   
     stdio_init_all();
-    uart_init_pico();
+    // uart_init_pico();
+    // ↓ SPI-slave initialization ↓
+    spi_init(SPI_PORT, SPI_BAUDRATE);
+    spi_set_slave(SPI_PORT, true);
+    gpio_set_function(SPI_SCK_PIN,  GPIO_FUNC_SPI);
+    gpio_set_function(SPI_MOSI_PIN, GPIO_FUNC_SPI);
+    gpio_set_function(SPI_MISO_PIN, GPIO_FUNC_SPI);
+    // leave CS as SIO input so we can poll it, or try FUNC_SPI if your board supports it:
+    gpio_init(SPI_CS_PIN);
+    gpio_set_dir(SPI_CS_PIN, GPIO_IN);
+    gpio_pull_up(SPI_CS_PIN);
+    
 
     adc_init();
     adc_gpio_init(THROTTLE_ADC_PIN);
@@ -228,12 +259,12 @@ int main()
                                        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
                                        true, &left_wheel_isr);
 
-    // gpio_init(RIGHT_RPM_SENSOR_PIN);
-    // gpio_set_dir(RIGHT_RPM_SENSOR_PIN, GPIO_IN);
-    // gpio_pull_up(RIGHT_RPM_SENSOR_PIN);
-    // gpio_set_irq_enabled_with_callback(RIGHT_RPM_SENSOR_PIN,
-    //    GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
-    //    true, &right_wheel_isr);
+    gpio_init(RIGHT_RPM_SENSOR_PIN);
+    gpio_set_dir(RIGHT_RPM_SENSOR_PIN, GPIO_IN);
+    gpio_pull_up(RIGHT_RPM_SENSOR_PIN);
+    gpio_set_irq_enabled_with_callback(RIGHT_RPM_SENSOR_PIN,
+       GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
+       true, &right_wheel_isr);
 
     uint32_t last_print_time = 0;
 
@@ -250,11 +281,35 @@ int main()
         // steering = read_steering();
 
         float left_rpm = calculate_rpm(left_velocity);
+        float right_rpm = calculate_rpm(right_velocity);
 
         if ((current_time - last_print_time) > 10000)
         {
-            // Timestamp in s, left rpm, throttle, steering
-            printf("%d %f %f %f\n", current_time, left_rpm, ((float)control) / 5500.0, steering);
+            // Timestamp in s, left rpm, right rpm, throttle, steering
+            // printf("%d %f %f %f\n", current_time, left_rpm, ((float)control) / 5500.0, steering);
+            // Prepare ASCII telemetry
+            char txbuf[64];
+            int len = snprintf(txbuf, sizeof(txbuf),
+                            "%u %d %f %f\n",
+                            current_time, left_rpm, right_rpm, 
+                            ((float)control)/5500.0f,
+                            steering);
+
+            // Wait for Pi to pull CS low (start of transaction)
+            while (gpio_get(SPI_CS_PIN)) tight_loop_contents();
+
+            // Clock our TX FIFO out while Pi drives SCLK
+            // spi_write_blocking(SPI_PORT, (uint8_t*)txbuf, len);
+
+            // Shift out via SPI-peripheral API
+            spi_write_read_blocking(SPI_PORT,
+                (const uint8_t*)txbuf,
+                NULL,
+                len);
+
+            // Wait for CS to go high again (end of transaction)
+            while (!gpio_get(SPI_CS_PIN)) tight_loop_contents();
+
             last_print_time = current_time;
         }
     }
