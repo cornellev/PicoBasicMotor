@@ -72,6 +72,10 @@ float min_scaling_vel = 0.0;
 float max_scaling_vel = 5.0;
 int min_duty_cycle = 825;
 
+// TIMESTAMP EXTENSION
+volatile uint64_t extended_timestamp = 0;
+volatile uint32_t last_timestamp = 0;
+
 float rolling_average(float *buffer, int size)
 {
     float sum = 0.0;
@@ -84,13 +88,29 @@ float rolling_average(float *buffer, int size)
 
 int calculate_rpm(float vel) { return (vel / M_PER_TICK) * 60.0; }
 
+uint32_t safe_time_difference(uint32_t newer, uint32_t older) {
+    if (newer >= older) {
+        return newer - older;
+    } else {
+        return (UINT32_MAX - older) + newer + 1;
+    }
+}
+
+uint64_t get_extended_timestamp() {
+    uint32_t current = time_us_32();
+    uint32_t delta = safe_time_difference(current, last_timestamp);
+    extended_timestamp += delta;
+    last_timestamp = current;
+    return extended_timestamp;
+}
+
 void left_wheel_isr(uint gpio, uint32_t events)
 {
     gpio_put(25, 1);
     uint32_t current_time = time_us_32();
     if (last_left_time != 0)
     {
-        uint32_t delta_time = current_time - last_left_time;
+        uint32_t delta_time = safe_time_difference(current_time, last_left_time);
         float new_velocity = M_PER_TICK / (delta_time / 1e6);
         left_velocity_buffer[left_index] = new_velocity;
         left_index = (left_index + 1) % FILTER_SIZE;
@@ -110,7 +130,7 @@ void right_wheel_isr(uint gpio, uint32_t events)
     uint32_t current_time = time_us_32();
     if (last_right_time != 0)
     {
-        uint32_t delta_time = current_time - last_right_time;
+        uint32_t delta_time = safe_time_difference(current_time, last_right_time);
         float new_velocity = M_PER_TICK / (delta_time / 1e6);
         right_velocity_buffer[right_index] = new_velocity;
         right_index = (right_index + 1) % FILTER_SIZE;
@@ -127,7 +147,7 @@ void on_pwm_wrap()
 {
     pwm_clear_irq(slice_num_a);
     uint32_t current_time_micro = time_us_32();
-    float delta_time_s = ((float)(current_time_micro - last_time_micro)) / 1e6;
+    float delta_time_s = ((float)(safe_time_difference(current_time_micro, last_time_micro))) / 1e6;
     last_time_micro = current_time_micro;
 
     float max_control =
@@ -259,21 +279,26 @@ int main()
                                        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
                                        true, &left_wheel_isr);
 
-    gpio_init(RIGHT_RPM_SENSOR_PIN);
-    gpio_set_dir(RIGHT_RPM_SENSOR_PIN, GPIO_IN);
-    gpio_pull_up(RIGHT_RPM_SENSOR_PIN);
-    gpio_set_irq_enabled_with_callback(RIGHT_RPM_SENSOR_PIN,
-       GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
-       true, &right_wheel_isr);
+    // gpio_init(RIGHT_RPM_SENSOR_PIN);
+    // gpio_set_dir(RIGHT_RPM_SENSOR_PIN, GPIO_IN);
+    // gpio_pull_up(RIGHT_RPM_SENSOR_PIN);
+    // gpio_set_irq_enabled_with_callback(RIGHT_RPM_SENSOR_PIN,
+    //    GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
+    //    true, &right_wheel_isr);
+
+    last_timestamp = time_us_32();
+    extended_timestamp = last_timestamp; 
 
     uint32_t last_print_time = 0;
+    uint64_t last_ext_print_time = 0;
 
     while (1)
     {
-        uint32_t current_time = time_us_32();
-        if ((current_time - last_left_time) > VELOCITY_TIMEOUT_US)
+        uint64_t current_ext_time = get_extended_timestamp();
+        uint32_t current_time = last_timestamp;
+        if (safe_time_difference(current_time, last_left_time) > VELOCITY_TIMEOUT_US)
             left_velocity = 0.0;
-        if ((current_time - last_right_time) > VELOCITY_TIMEOUT_US)
+        if (safe_time_difference(current_time, last_right_time) > VELOCITY_TIMEOUT_US)
             right_velocity = 0.0;
 
         throttle = read_throttle();
@@ -283,33 +308,11 @@ int main()
         float left_rpm = calculate_rpm(left_velocity);
         float right_rpm = calculate_rpm(right_velocity);
 
-        if ((current_time - last_print_time) > 10000)
+        if ((current_ext_time - last_ext_print_time) > 10000)
         {
-            // Timestamp in s, left rpm, right rpm, throttle, steering
-            // printf("%d %f %f %f\n", current_time, left_rpm, ((float)control) / 5500.0, steering);
-            // Prepare ASCII telemetry
-            char txbuf[64];
-            int len = snprintf(txbuf, sizeof(txbuf),
-                            "%u %d %f %f\n",
-                            current_time, left_rpm, right_rpm, 
-                            ((float)control)/5500.0f,
-                            steering);
-
-            // Wait for Pi to pull CS low (start of transaction)
-            while (gpio_get(SPI_CS_PIN)) tight_loop_contents();
-
-            // Clock our TX FIFO out while Pi drives SCLK
-            // spi_write_blocking(SPI_PORT, (uint8_t*)txbuf, len);
-
-            // Shift out via SPI-peripheral API
-            spi_write_read_blocking(SPI_PORT,
-                (const uint8_t*)txbuf,
-                NULL,
-                len);
-
-            // Wait for CS to go high again (end of transaction)
-            while (!gpio_get(SPI_CS_PIN)) tight_loop_contents();
-
+            // Timestamp in s, left rpm, throttle, steering
+            printf("%llu %f %f %f\n", current_ext_time, left_rpm, ((float)control) / 5500.0, steering);
+            last_ext_print_time = current_ext_time;
             last_print_time = current_time;
         }
     }
