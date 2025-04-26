@@ -279,12 +279,12 @@ int main()
                                        GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
                                        true, &left_wheel_isr);
 
-    // gpio_init(RIGHT_RPM_SENSOR_PIN);
-    // gpio_set_dir(RIGHT_RPM_SENSOR_PIN, GPIO_IN);
-    // gpio_pull_up(RIGHT_RPM_SENSOR_PIN);
-    // gpio_set_irq_enabled_with_callback(RIGHT_RPM_SENSOR_PIN,
-    //    GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
-    //    true, &right_wheel_isr);
+    gpio_init(RIGHT_RPM_SENSOR_PIN);
+    gpio_set_dir(RIGHT_RPM_SENSOR_PIN, GPIO_IN);
+    gpio_pull_up(RIGHT_RPM_SENSOR_PIN);
+    gpio_set_irq_enabled_with_callback(RIGHT_RPM_SENSOR_PIN,
+       GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
+       true, &right_wheel_isr);
 
     last_timestamp = time_us_32();
     extended_timestamp = last_timestamp; 
